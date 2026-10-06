@@ -359,7 +359,7 @@ func (s *Builder) Package(ctx context.Context, req *builderv0.PackageRequest) (*
 			return s.Builder.PackageError(fmt.Errorf("create target output: %w", err))
 		}
 		destination := filepath.Join(destinationDirectory, artifactName)
-		if err := packageGoBinary(ctx, s.Service.SourceLocation, destination, target); err != nil {
+		if err := packageGoBinary(ctx, s.Service.SourceLocation, destination, target, s.Settings.WithWorkspace); err != nil {
 			return s.Builder.PackageError(err)
 		}
 		digest, err := packageFileSHA256(destination)
@@ -466,8 +466,12 @@ func validPackageTargetComponent(value string) bool {
 	return true
 }
 
-func packageGoBinary(ctx context.Context, source, destination string, target *builderv0.PackageTarget) error {
-	moduleRoot, entry, err := resolvePackageSource(ctx, source, target)
+func packageGoBinary(ctx context.Context, source, destination string, target *builderv0.PackageTarget, useWorkspace bool) error {
+	workFile, err := packageWorkspace(ctx, source, useWorkspace)
+	if err != nil {
+		return err
+	}
+	moduleRoot, entry, err := resolvePackageSource(ctx, source, target, workFile)
 	if err != nil {
 		return err
 	}
@@ -482,10 +486,10 @@ func packageGoBinary(ctx context.Context, source, destination string, target *bu
 	}
 	defer os.Remove(temporaryPath)
 	if target.GetOs() == runtime.GOOS && target.GetArchitecture() == runtime.GOARCH {
-		if err := packageNativeGoBinary(ctx, moduleRoot, entry, temporaryPath, target); err != nil {
+		if err := packageNativeGoBinary(ctx, moduleRoot, entry, temporaryPath, target, workFile); err != nil {
 			return err
 		}
-	} else if err := packageCrossGoBinary(ctx, moduleRoot, entry, temporaryPath, target); err != nil {
+	} else if err := packageCrossGoBinary(ctx, moduleRoot, entry, temporaryPath, target, workFile); err != nil {
 		return err
 	}
 	if err := os.Chmod(temporaryPath, 0o755); err != nil {
@@ -497,14 +501,14 @@ func packageGoBinary(ctx context.Context, source, destination string, target *bu
 	return nil
 }
 
-func packageNativeGoBinary(ctx context.Context, source, entry, destination string, target *builderv0.PackageTarget) error {
+func packageNativeGoBinary(ctx context.Context, source, entry, destination string, target *builderv0.PackageTarget, workFile string) error {
 	command := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", destination, entry)
 	command.Dir = source
 	command.Env = append(os.Environ(),
 		"CGO_ENABLED=1",
 		"GOOS="+target.GetOs(),
 		"GOARCH="+target.GetArchitecture(),
-		"GOWORK=off",
+		"GOWORK="+workFile,
 	)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -533,13 +537,13 @@ func crossCGOToolchainFor(identity string) (crossCGOToolchain, bool) {
 	}
 }
 
-func packageCrossGoBinary(ctx context.Context, source, entry, destination string, target *builderv0.PackageTarget) (resultErr error) {
+func packageCrossGoBinary(ctx context.Context, source, entry, destination string, target *builderv0.PackageTarget, workFile string) (resultErr error) {
 	identity := target.GetOs() + "/" + target.GetArchitecture()
 	toolchain, supported := crossCGOToolchainFor(identity)
 	if !supported {
 		return fmt.Errorf("go package %s: no CGO cross toolchain; supported cross targets are darwin/amd64, darwin/arm64, linux/amd64, linux/arm64", identity)
 	}
-	goToolchain, err := resolvePackageGoToolchain(ctx, source)
+	goToolchain, err := resolvePackageGoToolchain(ctx, source, workFile)
 	if err != nil {
 		return err
 	}
@@ -568,6 +572,18 @@ func packageCrossGoBinary(ctx context.Context, source, entry, destination string
 	// entrypoint invokes goreleaser. Package needs the image's real Go and C/C++
 	// toolchains behind Codefly's typed process runner, so it explicitly clears
 	// that entrypoint and keeps the container alive for Docker exec.
+	localModules, err := packageLocalModules(ctx, source, workFile)
+	if err != nil {
+		return err
+	}
+	for _, directory := range localModules {
+		if directory != source { // the companion already mounts SourceDir here
+			runner.WithMount(directory, directory)
+		}
+	}
+	if workFile != "off" {
+		runner.WithMount(workFile, workFile)
+	}
 	runner.WithEntrypoint()
 	runner.WithMount(filepath.Dir(destination), filepath.Dir(destination))
 	runner.WithWorkDir(source)
@@ -587,7 +603,7 @@ func packageCrossGoBinary(ctx context.Context, source, entry, destination string
 		resources.Env("GOARCH", target.GetArchitecture()),
 		resources.Env("CC", toolchain.cc),
 		resources.Env("CXX", toolchain.cxx),
-		resources.Env("GOWORK", "off"),
+		resources.Env("GOWORK", workFile),
 		resources.Env("GOTOOLCHAIN", goToolchain),
 		resources.Env("HOME", "/tmp/codefly-home"),
 		resources.Env("GOCACHE", "/tmp/codefly-go-build"),

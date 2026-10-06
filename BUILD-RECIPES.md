@@ -1,5 +1,20 @@
 # Image recipe context
 
+## Executable packaging
+
+`Builder.Package` uses the service's `with-workspace` setting for both its
+executable and its SBOM. Development builds retain Go's selected `go.work`;
+standalone builds explicitly disable it. Source-package lookup and toolchain
+selection use the same setting. Cross compilation mounts the local modules
+reported by `go list -m -json all`, including filesystem replacements, at their
+original paths so the container resolves the same graph as the native build.
+
+The packaging tests execute a binary whose result changes with workspace
+selection and check the corresponding SBOM dependency. The opt-in real-CGO suite
+also compiles a workspace-only sibling dependency through the cross toolchain.
+
+## Image build context
+
 The Go agent assembles a self-contained build tree in the caller's
 `BuildRequest.output_directory`. It carries repository-local Go replacements
 under `code/_replace/` and rewrites only the emitted go.mod. The original service

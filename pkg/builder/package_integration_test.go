@@ -21,6 +21,16 @@ import (
 // This fixture requires both the current Go language version and a real C
 // compiler. A pure-Go binary or metadata-only package test misses both failures.
 func TestPackageRealCGO(t *testing.T) {
+	for _, workspace := range []bool{false, true} {
+		name := "standalone"
+		if workspace {
+			name = "workspace"
+		}
+		t.Run(name, func(t *testing.T) { testPackageRealCGO(t, workspace) })
+	}
+}
+
+func testPackageRealCGO(t *testing.T, workspace bool) {
 	if os.Getenv("SERVICE_GO_PACKAGE_TESTS") != "required" {
 		t.Skip("set SERVICE_GO_PACKAGE_TESTS=required for real native/cross packaging")
 	}
@@ -32,7 +42,10 @@ func TestPackageRealCGO(t *testing.T) {
 	if output, err := exec.CommandContext(ctx, "docker", "info").CombinedOutput(); err != nil {
 		t.Fatalf("packaging requires Docker: %v: %s", err, output)
 	}
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	scope, err := dockerrun.NewContainerRecoveryScope(root, root, t.Name())
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +70,25 @@ func TestPackageRealCGO(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	selectedToolchain, err := resolvePackageGoToolchain(ctx, source)
+	if workspace {
+		// A sibling module absent from go.mod forces the cross build to use the
+		// selected workspace. Compiling standalone cannot silently succeed.
+		dependency := filepath.Join(root, "dependency")
+		if err := os.Mkdir(dependency, 0700); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(dependency, "go.mod"), "module example.com/local-value\n\ngo 1.27.1\n", 0600)
+		mustWrite(t, filepath.Join(dependency, "value.go"), "package value\nconst Value = 42\n", 0600)
+		mustWrite(t, filepath.Join(source, "value.go"), "package regression\nimport \"example.com/local-value\"\nconst Value = value.Value\n", 0600)
+		work := filepath.Join(root, "go.work")
+		mustWrite(t, work, "go 1.27.1\nuse (\n ./source\n ./dependency\n)\n", 0600)
+		t.Setenv("GOWORK", work)
+	}
+	workFile, err := packageWorkspace(ctx, source, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedToolchain, err := resolvePackageGoToolchain(ctx, source, workFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +106,7 @@ func TestPackageRealCGO(t *testing.T) {
 		seen[identity] = true
 		t.Run(identity, func(t *testing.T) {
 			destination := filepath.Join(root, strings.ReplaceAll(identity, "/", "-"))
-			if err := packageGoBinary(ctx, filepath.Join(source, "cmd", "agent"), destination, target); err != nil {
+			if err := packageGoBinary(ctx, filepath.Join(source, "cmd", "agent"), destination, target, workspace); err != nil {
 				t.Fatal(err)
 			}
 			info, err := os.Stat(destination)
